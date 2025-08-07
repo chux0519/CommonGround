@@ -12,9 +12,8 @@ from ...framework.tool_registry import tool_registry
 from ...state.management import _create_flow_specific_state_template 
 from ...framework.profile_utils import get_active_profile_by_name
 from ...framework.handover_service import HandoverService
-# +++ START: New imports +++
-# from utils.server_manager import initialize_mcp_session_for_context # No longer needed
-# +++ END: New imports +++
+from a2a.types import SendMessageRequest, MessageSendParams, Message, MessagePart
+from agent_core.a2a_bridge.router import A2A_ROUTER
 
 logger = logging.getLogger(__name__)
 
@@ -149,204 +148,78 @@ class DispatcherNode(AsyncParallelBatchNode):
         })
         return tasks_for_parallel_exec
 
+    # 注意：为了让 dispatcher 调用 RAG 工具, 我们需要修改它的 @tool_registry 参数
+    # 或者创建一个新的 tool, 例如 `invoke_associate_skill`。
+    # 为了 MVP，我们暂时在 exec_async 内部硬编码逻辑。
+    # prep_async 保持不变, 它会解析出 Principal 想分配的任务
     async def exec_async(self, assignment_package: Dict) -> Dict:
-        parent_context = assignment_package.pop("shared_for_exec_context") # This is Principal's SubContext
-        run_context_global = parent_context['refs']['run'] # This is the global RunContext
-        team_state_global = parent_context['refs']['team'] # This is the global TeamState
-        events = run_context_global['runtime'].get("event_manager")
-        run_id = run_context_global['meta'].get("run_id")
-
-        if "_ongoing_associate_tasks" not in run_context_global['sub_context_refs']:
-            run_context_global['sub_context_refs']["_ongoing_associate_tasks"] = {}
-
-        module_to_execute = assignment_package["module_to_execute"]
-        module_id = module_to_execute["module_id"]
-        executing_associate_id = assignment_package["executing_associate_id"]
-        profile_logical_name = assignment_package["resolved_profile_logical_name"]
+        parent_context = assignment_package.pop("shared_for_exec_context")
+        run_context_global = parent_context['refs']['run']
         
-        logger.info("dispatcher_exec_assignment_started", extra={
-            "module_id": module_id,
-            "profile_logical_name": profile_logical_name,
-            "executing_associate_id": executing_associate_id
-        })
-
-        module_to_update = copy.deepcopy(team_state_global.get("work_modules", {}).get(module_id))
-        if not module_to_update:
-            return {"error": f"Module {module_id} not found at execution time."}
+        # 1. 从 assignment 中推断要调用的 A2A Agent 和 Skill
+        # 这是一个关键的逻辑转换点。
+        # 旧逻辑: 分配一个模块给一个 Agent Profile.
+        # 新逻辑: 调用一个 Agent 的特定 Skill 来处理一个模块。
         
-        start_time_iso = datetime.now(timezone.utc).isoformat()
-        module_to_update["status"] = "ongoing"
-        module_to_update["updated_at"] = start_time_iso
-        module_to_update.setdefault("assignee_history", []).append({
-            "dispatch_id": executing_associate_id, "agent_id": executing_associate_id,
-            "started_at": start_time_iso, "ended_at": None, "outcome": "running"
-        })
-        team_state_global["work_modules"][module_id] = module_to_update
-        if events and hasattr(events, "emit_work_module_updated"):
-            await events.emit_work_module_updated(run_id, module_to_update)
+        agent_profile_name = assignment_package.get("resolved_profile_logical_name")
+        
+        # --- MVP 的核心假设 ---
+        # 我们假设，如果分配给了 SmartRAG_EN, 那么就是要调用它的 rag_query skill.
+        if agent_profile_name != "Associate_SmartRAG_EN":
+            return {"error": f"MVP only supports dispatching to Associate_SmartRAG_EN, but got {agent_profile_name}"}
 
-        try:
-            from ...events.event_triggers import trigger_view_model_update
-            await trigger_view_model_update(parent_context, "kanban_view")
-            logger.info("dispatcher_kanban_view_update_triggered", extra={"module_id": module_id, "new_status": "ongoing"})
-        except Exception as e_trigger:
-            logger.error("dispatcher_kanban_view_update_failed", extra={"module_id": module_id, "error": str(e_trigger)}, exc_info=True)
+        target_a2a_agent_name = "A2A_SmartRAG"
+        skill_to_call = "rag_query"
+        
+        # 2. 构造 A2A Intent (SendMessageRequest) 的参数
+        # 从 assignment_package 中提取 rag_query 需要的参数
+        module_description = assignment_package.get("module_to_execute", {}).get("description", "")
+        tool_params = {"question": module_description} # 假设模块描述就是查询问题
 
-        history_entry = {
-            "dispatch_id": executing_associate_id, "dispatch_tool_call_id_ref": assignment_package["dispatch_tool_call_id_ref"],
-            "module_id": module_id, "profile_logical_name": profile_logical_name, "start_timestamp": None,
-            "end_timestamp": None, "status": "LAUNCHING", "final_summary": None, "error_details": None
+        send_params = MessageSendParams(
+            message=Message(role='user', parts=[MessagePart(kind='text', text=f"Query for module {assignment_package.get('module_to_execute', {}).get('module_id')}")])
+        )
+        # A2A SDK v0.2.0+ 将 skill_id 和 parameters 移到了 params 内部
+        send_params.skill_id = skill_to_call
+        send_params.parameters = tool_params
+        send_params.context = {
+            "run_id": run_context_global['meta'].get("run_id"),
+            "project_id": run_context_global.get("project_id") # RAG 工具需要 project_id
         }
-        team_state_global.setdefault("dispatch_history", []).append(history_entry)
-        logger.info("dispatcher_history_entry_added", extra={"executing_associate_id": executing_associate_id, "status": "LAUNCHING"})
+        
+        a2a_intent = SendMessageRequest(id=str(uuid.uuid4()), params=send_params)
 
         try:
-            # Build a temporary source_context to simulate the state when the Principal calls the tool
-            temp_source_context_for_handover = {
-                "state": { 
-                    "current_action": {
-                        # Place the current assignment's parameters into current_action.parameters
-                        "parameters": assignment_package.get("original_assignment_input", {})
-                    }
-                },
-                "refs": parent_context["refs"],
-                "meta": parent_context["meta"]
-            }
-            
-            # Call HandoverService
-            inbox_item_data = await HandoverService.execute(
-                "principal_to_associate_briefing", 
-                temp_source_context_for_handover
-            )
+            # 3. 通过内存路由器发送 Intent
+            a2a_result = await A2A_ROUTER.route_intent(target_a2a_agent_name, a2a_intent)
+
+            # 4. 解析结果
+            if a2a_result.get("status") == "success":
+                # 提取 JSON 结果
+                final_tool_result = {}
+                message_data = a2a_result.get("message", {})
+                for part in message_data.get("parts", []):
+                    if part.get('kind') == 'json' and part.get('json_value'):
+                        final_tool_result = part['json_value']
+                        break
+                
+                # 返回与旧版兼容的结构
+                return {
+                    "executing_associate_id": assignment_package["executing_associate_id"],
+                    "module_id": assignment_package["module_to_execute"]["module_id"],
+                    "status_of_associate_execution": "success",
+                    "deliverables_from_associate": final_tool_result,
+                    "error_detail_from_associate": None,
+                    "new_messages_from_associate": []
+                }
+            else:
+                error_msg = a2a_result.get("error", "Unknown A2A routing error")
+                return {"error": error_msg}
 
         except Exception as e:
-            logger.error("dispatcher_handover_service_failed", extra={"executing_associate_id": executing_associate_id, "error": str(e)}, exc_info=True)
-            return {"error": f"Failed to prepare context handover: {e}"}
-
-        associate_sub_context_state = _create_flow_specific_state_template()
-        associate_sub_context_state.setdefault("inbox", []).append({
-            "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
-            "source": inbox_item_data["source"],
-            "payload": inbox_item_data["payload"],
-            "consumption_policy": "consume_on_read",
-            "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
-        })
-        
-        principal_last_turn_id = parent_context['state'].get("last_turn_id")
-        associate_sub_context_state['last_turn_id'] = principal_last_turn_id
-        logger.debug("dispatcher_last_turn_id_passed", extra={"last_turn_id": principal_last_turn_id, "executing_associate_id": executing_associate_id})
-
-        principal_agent_id = parent_context['meta'].get("agent_id")
-        assigned_role_name = assignment_package.get("assigned_role_name")
-        
-        associate_sub_context: Dict[str, Any] = {
-            "meta": {
-                "run_id": run_id,
-                "agent_id": executing_associate_id,
-                "parent_agent_id": principal_agent_id,
-                "assigned_role_name": assigned_role_name,
-                "module_id": module_id,
-                "module_description": module_to_execute.get("description"),
-                "profile_logical_name": profile_logical_name,
-                "profile_instance_id": assignment_package["resolved_profile_instance_id"],
-                "dispatch_tool_call_id_ref": assignment_package["dispatch_tool_call_id_ref"],
-            },
-            "state": associate_sub_context_state,
-            "runtime_objects": {},
-            "refs": { "run": run_context_global, "team": team_state_global }
-        }
-        
-        logger.info("dispatcher_associate_starting", extra={"executing_associate_id": executing_associate_id})
-        
-        completed_associate_context = None
-        associate_exec_status = "error"
-        last_turn_id = None
-        new_messages_from_associate = []
-        try:
-            if run_context_global:
-                run_context_global['sub_context_refs']["_ongoing_associate_tasks"][executing_associate_id] = associate_sub_context
-                logger.info("dispatcher_associate_task_registered", extra={"executing_associate_id": executing_associate_id})
-            from ...flow import run_associate_async
-            completed_associate_context = await run_associate_async(associate_sub_context)
-            
-            final_associate_state = completed_associate_context.get("state", {})
-            last_turn_id = final_associate_state.get("last_turn_id")
-
-            if not final_associate_state.get("error_message"):
-                associate_exec_status = "success"
-        except Exception as e:
-            logger.error("dispatcher_associate_critical_error", extra={"executing_associate_id": executing_associate_id, "error": str(e)}, exc_info=True)
-            if completed_associate_context is None: completed_associate_context = {}
-            final_associate_state = completed_associate_context.setdefault("state", {})
-            final_associate_state["error_message"] = f"Dispatcher critical error: {str(e)}"
-            final_associate_state.setdefault("deliverables", {})["error"] = f"Dispatcher critical error: {str(e)}"
-        
-        finally:
-            end_time_iso = datetime.now(timezone.utc).isoformat()
-            final_outcome = "completed_success" if associate_exec_status == "success" else "completed_error"
-            
-            final_associate_state = completed_associate_context.get("state", {}) if completed_associate_context else {}
-            deliverables_from_associate = final_associate_state.get("deliverables", {})
-            error_details_from_associate = final_associate_state.get("error_message")
-            
-            all_messages = final_associate_state.get("messages", [])
-            
-            # Filter out messages that are marked as not for handover (e.g., initial briefings).
-            # The msg.get("_internal", {}) ensures safe access even if the _internal key doesn't exist.
-            new_messages_from_associate = [
-                msg for msg in all_messages if not msg.get("_internal", {}).get("_no_handover")
-            ]
-
-            logger.info("dispatcher_messages_extracted", extra={"executing_associate_id": executing_associate_id, "new_message_count": len(new_messages_from_associate)})
-
-            history_entry_to_update = next((h for h in team_state_global.get("dispatch_history", []) if h.get("dispatch_id") == executing_associate_id), None)
-            if history_entry_to_update:
-                status_map = {"success": "COMPLETED_SUCCESS", "error": "COMPLETED_ERROR"}
-                history_entry_to_update["status"] = status_map.get(associate_exec_status, "COMPLETED_ERROR")
-                history_entry_to_update["end_timestamp"] = end_time_iso
-                history_entry_to_update["error_details"] = error_details_from_associate
-                if deliverables_from_associate:
-                    summary = ", ".join(deliverables_from_associate.keys())
-                    history_entry_to_update["final_summary"] = f"Deliverables: {summary}"
-                logger.info("dispatcher_history_updated", extra={"executing_associate_id": executing_associate_id, "new_status": history_entry_to_update['status']})
-            
-            history_list = module_to_update.get("assignee_history", [])
-            entry_to_update = next((h for h in reversed(history_list) if h.get("dispatch_id") == executing_associate_id and h.get("outcome") == "running"), None)
-            if entry_to_update:
-                entry_to_update["ended_at"] = end_time_iso
-                entry_to_update["outcome"] = final_outcome
-
-            module_to_update.setdefault("context_archive", []).append({
-                "dispatch_id": executing_associate_id, "archived_at": end_time_iso,
-                "messages": final_associate_state.get("messages", []), "deliverables": deliverables_from_associate
-            })
-            
-            module_to_update["status"] = "pending_review"
-            module_to_update["review_info"] = {
-                "trigger": "associate_completed" if associate_exec_status == "success" else "associate_failed",
-                "message": "Associate completed its work." if associate_exec_status == "success" else "Associate failed with an exception.",
-                "error_details": error_details_from_associate
-            }
-            module_to_update["updated_at"] = end_time_iso
-            team_state_global["work_modules"][module_id] = module_to_update
-            if events and hasattr(events, "emit_work_module_updated"):
-                await events.emit_work_module_updated(run_id, module_to_update)
-
-            if run_context_global and executing_associate_id in run_context_global['sub_context_refs'].get("_ongoing_associate_tasks", {}):
-                del run_context_global['sub_context_refs']["_ongoing_associate_tasks"][executing_associate_id]
-                logger.info("dispatcher_associate_task_deregistered", extra={"executing_associate_id": executing_associate_id})
-
-        return {
-            "executing_associate_id": executing_associate_id, 
-            "module_id": module_id,
-            "agent_profile_logical_name_used": profile_logical_name, 
-            "status_of_associate_execution": associate_exec_status,
-            "deliverables_from_associate": deliverables_from_associate, 
-            "error_detail_from_associate": error_details_from_associate,
-            "last_turn_id": last_turn_id,
-            "new_messages_from_associate": new_messages_from_associate
-        }
-
+            logger.error(f"In-memory A2A dispatch failed: {e}", exc_info=True)
+            return {"error": f"Failed to dispatch task via in-memory A2A router: {e}"}
+    
     async def post_async(self, shared: Dict, prep_res: List[Dict], exec_res_list: List[Dict]):
         principal_state = shared["state"]
         dispatch_tool_call_id = principal_state.get("current_tool_call_id", f"dtcid_unknown_{uuid.uuid4().hex[:4]}")

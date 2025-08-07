@@ -9,10 +9,9 @@ from mcp.client.session_group import ClientSessionGroup, StdioServerParameters, 
 from .file_monitor import start_file_monitoring
 from ..iic.core.iic_handlers import BASE_DIR
 from ..config.app_config import NATIVE_MCP_SERVERS
-# --- START: Modified code ---
-# Import initialize_registry from tool_registry
 from ..framework.tool_registry import initialize_registry
-# --- END: Modified code ---
+from ..a2a_bridge.router import A2A_ROUTER
+from ..a2a_bridge.executors import SmartRAG_A2A_Executor 
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +29,15 @@ MCP_SESSION_POOL: Optional[asyncio.Queue] = None
 @asynccontextmanager
 async def lifespan_manager(app: FastAPI):
     """
-    [Modified] FastAPI's lifespan manager, implementing a better "discover and pool" logic.
+    [REFACTORED] FastAPI's lifespan manager.
+    Initializes all application-level resources including Logging, MCP, Tool Registry,
+    the new A2A In-Memory Bridge, and File Monitoring.
     """
-    global MCP_SESSION_POOL
-    
+    # ==================================================================
+    # PHASE 1: PRE-INITIALIZATION (Logging)
+    # This part remains unchanged.
+    # ==================================================================
+    # ... (your existing logging reconfiguration code) ...
     # Re-configure logging after uvicorn potentially modified it
     try:
         from ..config.logging_config import setup_global_logging
@@ -53,56 +57,84 @@ async def lifespan_manager(app: FastAPI):
         logger.error("logging_reconfiguration_failed", extra={"description": "Failed to reconfigure logging", "error": str(e)})
     
     logger.info("application_startup_begin", extra={"description": "Initializing resources via lifespan manager"})
-    
-    
-    # 1. Initialize an empty session pool
+
+    # ==================================================================
+    # PHASE 2: TOOL & AGENT INITIALIZATION
+    # This is the main area of change.
+    # ==================================================================
+
+    # 2.1: Initialize MCP Session Pool (remains unchanged)
+    global MCP_SESSION_POOL
     MCP_SESSION_POOL = asyncio.Queue()
-    logger.info("mcp_session_pool_initialized", extra={"description": "MCP Session Pool initialized"})
+    logger.info("mcp_session_pool_initialized")
     
-    # 2. Create a session group specifically for tool discovery
-    logger.info("tool_discovery_session_create_begin", extra={"description": "Creating a session group for initial tool discovery"})
+    # 2.2: Discover external tools via MCP (remains unchanged)
+    logger.info("tool_discovery_session_create_begin")
     discovery_session_group = await initialize_mcp_session_for_context()
     
-    # 3. Use this session group to initialize the tool registry
+    # 2.3: Initialize the Tool Registry (remains unchanged)
+    # This step is crucial. It loads all your Python-based tools (`@tool_registry`)
+    # AND any discovered MCP tools into the central `_TOOL_REGISTRY`.
     if discovery_session_group:
-        logger.info("tool_registry_init_begin", extra={"description": "Passing discovery session to initialize the tool registry"})
         await initialize_registry(discovery_session_group, "agent_core/nodes/custom_nodes")
-        
-        # 4. [Core] Put the session group used for discovery directly into the pool as the first available resource
         await release_mcp_session_to_pool(discovery_session_group)
-        logger.info("tool_discovery_session_pooled", extra={"description": "Tool discovery session has been successfully pooled for reuse"})
+        logger.info("tool_discovery_session_pooled")
     else:
-        logger.warning("tool_discovery_session_failed", extra={"description": "Failed to create discovery session group. No native MCP tools will be registered"})
-        # Even if discovery fails, continue to initialize an empty registry
+        logger.warning("tool_discovery_session_failed")
+        # Still initialize with internal tools even if MCP fails
         await initialize_registry(None, "agent_core/nodes/custom_nodes")
-    
-    logger.info("file_monitor_start", extra={"description": "Starting file monitor", "directory": BASE_DIR})
+
+    # +++ 2.4: NEW - Initialize and Register In-Memory A2A Agents +++
+    # This new block runs AFTER the tool registry is initialized, because our
+    # A2A Executors might depend on it (e.g., to find tool node classes).
+    try:
+        logger.info("a2a_bridge_registration_starting")
+        
+        # Instantiate and register each built-in Associate's executor
+        A2A_ROUTER.register_agent("A2A_SmartRAG", SmartRAG_A2A_Executor())
+        # As you create more executors, register them here:
+        # A2A_ROUTER.register_agent("A2A_WebDeveloper", WebDeveloperA2AExecutor())
+        
+        logger.info("a2a_bridge_registration_complete", extra={"registered_agents": list(A2A_ROUTER._executors.keys())})
+    except Exception as e:
+        logger.error("a2a_bridge_registration_failed", exc_info=True)
+    # +++ END OF NEW BLOCK +++
+
+    # ==================================================================
+    # PHASE 3: BACKGROUND SERVICES INITIALIZATION
+    # ==================================================================
+
+    # 3.1: Start File Monitor (remains unchanged)
+    logger.info("file_monitor_start", extra={"directory": BASE_DIR})
     start_file_monitoring(BASE_DIR, loop=asyncio.get_running_loop())
-    # Core of the Lifespan Manager: yield control to the FastAPI application
+    
+    # Let the application run
+    logger.info("application_startup_complete")
     yield
     
-    # When the application shuts down, this code will be executed
-    logger.info("application_shutdown_begin", extra={"description": "Cleaning up resources via lifespan manager"})
+    # ==================================================================
+    # PHASE 4: SHUTDOWN & CLEANUP
+    # This part remains unchanged.
+    # ==================================================================
+    logger.info("application_shutdown_begin")
     
-    # 5. When the application shuts down, clean up all remaining sessions in the pool
+    # ... (your existing MCP pool cleanup code) ...
     if MCP_SESSION_POOL:
-        logger.info("mcp_session_pool_cleanup_begin", extra={"description": "Closing idle MCP sessions from the pool", "session_count": MCP_SESSION_POOL.qsize()})
+        logger.info("mcp_session_pool_cleanup_begin", extra={"session_count": MCP_SESSION_POOL.qsize()})
         while not MCP_SESSION_POOL.empty():
             try:
                 session_to_close = MCP_SESSION_POOL.get_nowait()
                 try:
                     await session_to_close.__aexit__(None, None, None)
                 except Exception:
-                    logger.warning("mcp_session_graceful_exit_failed", extra={"description": "DUE to MCP SDK Limitation - this session can not gracefully exit. Accumulating too many this error might drain your resource, but it should be fine as far as you are not running this as a service"})
+                    logger.warning("mcp_session_graceful_exit_failed")
             except asyncio.QueueEmpty:
                 break
-            # This outer exception handler is now only for get_nowait()
             except Exception as e:
-                logger.error("mcp_session_pool_shutdown_error", extra={"description": "Error retrieving session from pool during shutdown", "error": str(e)}, exc_info=True)
-        logger.info("mcp_session_pool_cleanup_complete", extra={"description": "All idle MCP sessions from the pool have been closed"})
+                logger.error("mcp_session_pool_shutdown_error", exc_info=True)
+        logger.info("mcp_session_pool_cleanup_complete")
 
-    
-    logger.info("application_shutdown_complete", extra={"description": "Application shutdown complete"})
+    logger.info("application_shutdown_complete")
 
 # --- START: Modified code - Remove get_session_group ---
 # def get_session_group() -> Optional[ClientSessionGroup]:
