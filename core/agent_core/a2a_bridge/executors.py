@@ -1,7 +1,7 @@
 import logging
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.utils import new_agent_json_message
+from a2a.utils import new_agent_text_message
 
 # 导入您自己的 RAG 工具节点
 from agent_core.nodes.custom_nodes.list_rag_sources_tool import ListRAGSourcesNode
@@ -61,7 +61,7 @@ class SmartRAG_A2A_Executor(AgentExecutor):
         # 对于 RAGQueryNode，exec_res 就是我们想要的结果。
 
         # 4. 将结果包装成 A2A 事件
-        await event_queue.enqueue_event(new_agent_json_message(exec_res))
+        await event_queue.enqueue_event(new_agent_text_message(exec_res))
         
         # 5. 发送 done 事件
         await event_queue.enqueue_done_event()

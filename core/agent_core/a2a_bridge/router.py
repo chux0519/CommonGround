@@ -4,7 +4,7 @@ from typing import Dict, Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import Event, EventQueue
-from a2a.types import SendMessageRequest, Message, MessagePart, AgentMessage
+from a2a.types import SendMessageRequest, Message
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class InMemoryA2ARouter:
         if error_message:
             return {"status": "failure", "error": error_message}
 
-        final_message = AgentMessage(role='agent', parts=final_parts)
+        final_message = Message(role='agent', parts=final_parts)
         return {"status": "success", "message": final_message.model_dump()}
 
 # 创建一个全局单例
