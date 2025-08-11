@@ -3,6 +3,7 @@ import logging
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
+from a2a.types import TaskStatusUpdateEvent, TaskStatus, TaskState
 
 # 导入您自己的 RAG 工具节点
 from agent_core.nodes.custom_nodes.list_rag_sources_tool import ListRAGSourcesNode
@@ -67,11 +68,19 @@ class SmartRAG_A2A_Executor(AgentExecutor):
         await event_queue.enqueue_event(new_agent_text_message(res_txt))
         
         # 5. 发送 done 事件
-        # FIXME: should manually create TaskStatusUpdateEvent
-        # await event_queue.enqueue_event(TaskStatusUpdateEvent(status='done'))
+        done_event = TaskStatusUpdateEvent(
+            task_id=context.task_id,
+            context_id=context.context_id,
+            status=TaskStatus(state=TaskState.completed),
+            final=True
+        )
+        await event_queue.enqueue_event(done_event)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # 实现 cancel 逻辑 (MVP 中可忽略)
-        await event_queue.enqueue_error_event('Cancel not supported.')
-        # FIXME: should manually create TaskStatusUpdateEvent
-        # await event_queue.enqueue_event(TaskStatusUpdateEvent(status='done'))
+        cancel_event = TaskStatusUpdateEvent(
+            task_id=context.task_id,
+            context_id=context.context_id,
+            status=TaskStatus(state=TaskState.canceled, message="Task was cancelled."),
+            final=True
+        )
+        await event_queue.enqueue_event(cancel_event)
