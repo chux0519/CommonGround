@@ -59,193 +59,125 @@ class CommonGroundRAGTester:
                 print("❌ Server health check failed")
                 return False
 
-    async def test_list_rag_sources(self):
-        """Test listing available RAG sources via session."""
-        print("\n" + "="*60)
-        print("TEST: List RAG Sources via WebSocket")
-        print("="*60)
-        
-        try:
-            # Create session first
-            session_result = await self._make_request("POST", "/session", {})
-            session_id = session_result.get("session_id")
-            
-            if not session_id:
-                print("❌ Failed to create session for RAG sources test")
-                return None
-                
-            print(f"✓ Created session: {session_id}")
-            return {"session_id": session_id, "status": "ready_for_websocket"}
-            
-        except Exception as e:
-            print(f"❌ List RAG sources test failed: {e}")
-            return None
-
-    async def test_rag_query(self, question: str = "What is CommonGround?"):
-        """Test RAG query functionality via WebSocket."""
-        print("\n" + "="*60)
-        print(f"TEST: RAG Query via WebSocket - '{question}'")
-        print("="*60)
-        
-        try:
-            # Create session first
-            session_result = await self._make_request("POST", "/session", {})
-            session_id = session_result.get("session_id")
-            
-            if not session_id:
-                print("❌ Failed to create session for RAG query test")
-                return None
-                
-            print(f"✓ Created session: {session_id}")
-            return {"session_id": session_id, "question": question, "status": "ready_for_websocket"}
-            
-        except Exception as e:
-            print(f"❌ RAG query test failed: {e}")
-            return None
 
     async def test_websocket_rag_stream(self, question: str = "How does agent collaboration work?"):
-        """Test RAG functionality via WebSocket streaming."""
+        """
+        [REVISED] Tests the full Principal -> Associate (A2A) -> Principal RAG flow.
+        """
         print("\n" + "="*60)
-        print(f"TEST: WebSocket RAG Stream - '{question}'")
+        print(f"TEST: Full A2A RAG Flow - '{question}'")
         print("="*60)
         
         try:
-            # First create a session
+            # Step 1 & 2: Create session and connect to WebSocket (no changes needed)
             session_result = await self._make_request("POST", "/session", {})
             session_id = session_result.get("session_id")
             if not session_id:
                 print("❌ Failed to create session")
                 return False
-            
             print(f"✓ Created session: {session_id}")
             
-            # Import websockets
             import websockets
-            
             uri = f"ws://127.0.0.1:8000/ws/{session_id}"
             
             async with websockets.connect(uri) as websocket:
                 print(f"✓ Connected to WebSocket")
                 
-                # Send start_run message with required fields
+                # Step 3: Start a 'principal_direct' run (no changes needed)
                 start_message = {
                     "type": "start_run",
                     "data": {
                         "request_id": str(uuid.uuid4()),
-                        "run_type": "partner_interaction",
-                        "user_prompt": question,
-                        "agent_profile": "Associate_SmartRAG_EN",
-                        "project_id": "default"
+                        "run_type": "principal_direct",
+                        "project_id": "default",
+                        "cli_mode_default_profiles": ["Associate_SmartRAG_EN"]
                     }
                 }
-                
                 await websocket.send(json.dumps(start_message))
-                print(f"✓ Sent start_run message")
+                print(f"✓ Sent start_run message for a DIRECT PRINCIPAL run")
                 
-                # Wait for run_ready confirmation
+                # Step 4: Wait for run_ready (no changes needed)
                 run_id = None
-                request_id = start_message["data"]["request_id"]
-                
                 try:
                     response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                     data = json.loads(response)
-                    print(f"✓ Initial response: {data.get('type', 'unknown')}")
-                    
                     if data.get('type') == 'run_ready':
                         run_id = data.get('data', {}).get('run_id')
                         print(f"✓ Run ready: {run_id}")
-                    elif data.get('type') == 'error':
-                        print(f"❌ Start run error: {data.get('data', {}).get('message', 'Unknown error')}")
+                    else:
+                        print(f"❌ Start run error: {data}")
                         return False
-                        
                 except asyncio.TimeoutError:
                     print("❌ Timeout waiting for run_ready")
                     return False
+                if not run_id: return False
                 
-                if not run_id:
-                    print("❌ No run_id received")
-                    return False
-                
-                # Now send the actual user message
+                # Step 5: Send initial directive to Principal (no changes needed)
                 user_message = {
                     "type": "send_to_run",
                     "data": {
                         "run_id": run_id,
-                        "message_payload": {
-                            "prompt": question
-                        }
+                        "message_payload": {"prompt": question}
                     }
                 }
-                
                 await websocket.send(json.dumps(user_message))
-                print(f"✓ Sent user message: {question[:50]}...")
+                print(f"✓ Sent initial directive to Principal: {question[:50]}...")
                 
-                # Listen for responses with strict timeout handling
-                response_count = 0
-                last_activity = time.time()
-                max_timeout = 30.0  # 30 seconds total timeout - fail if exceeded
-                individual_timeout = 8.0  # 8 seconds for individual messages
+                # +++ START: REVISED LISTENING LOGIC +++
                 
-                while response_count < 20 and (time.time() - last_activity) < max_timeout:
+                print("\n--- Listening for full A2A dispatch and result cycle ---")
+                
+                # We now have two success criteria to meet in order
+                plan_created = False
+                dispatch_completed = False
+                
+                max_timeout = 90.0  # Increased total timeout to 90 seconds for the full flow
+                start_time = time.time()
+                
+                while not dispatch_completed and (time.time() - start_time) < max_timeout:
                     try:
-                        response = await asyncio.wait_for(websocket.recv(), timeout=individual_timeout)
+                        response = await asyncio.wait_for(websocket.recv(), timeout=20.0) # Increased per-message timeout
                         data = json.loads(response)
-                        last_activity = time.time()
-                        response_count += 1
                         
                         msg_type = data.get('type', 'unknown')
-                        print(f"✓ WebSocket response {response_count}: {msg_type}")
+                        agent_id = data.get('agent_id', 'System')
                         
-                        if msg_type == 'agent_message':
-                            content = data.get('data', {}).get('content', '')
-                            role = data.get('data', {}).get('role', 'unknown')
-                            print(f"   {role}: {content[:100]}...")
-                        elif msg_type == 'tool_execution_start':
-                            tool_name = data.get('data', {}).get('tool_name', '')
-                            print(f"   🔧 Tool starting: {tool_name}")
-                        elif msg_type == 'tool_execution_result':
-                            tool_name = data.get('data', {}).get('tool_name', '')
-                            success = data.get('data', {}).get('success', False)
-                            print(f"   ✅ Tool result: {tool_name} ({'success' if success else 'failed'})")
-                        elif msg_type == 'run_complete':
-                            print("   ✅ Run completed successfully")
-                            return True
-                        elif msg_type == 'error':
-                            error_msg = data.get('data', {}).get('message', 'Unknown error')
-                            print(f"   ❌ Error: {error_msg}")
-                            return False  # Fail immediately on error
-                        elif msg_type == 'turn_complete':
-                            print("   ✅ Turn completed")
-                        else:
-                            # Print other message types for debugging
-                            print(f"   📄 {msg_type}: {str(data.get('data', {}))[:50]}...")
-                            
+                        print(f"✓ WS Recv: {msg_type} from {agent_id}")
+
+                        # Checkpoint 1: Principal creates the plan
+                        if msg_type == 'llm_response' and agent_id == 'Principal':
+                            tool_calls = data.get('data', {}).get('tool_calls', [])
+                            if any(tc.get('function', {}).get('name') == 'manage_work_modules' for tc in tool_calls):
+                                print("  -> CHECKPOINT 1: Principal called 'manage_work_modules'. Plan created.")
+                                plan_created = True
+
+                        # Checkpoint 2: Principal receives the RAG result
+                        if msg_type == 'llm_response' and agent_id == 'Principal' and plan_created:
+                             # The final success is seeing the Principal's *reaction* to the RAG result
+                             content = data.get('data', {}).get('content', '')
+                             if "search_results" in content or "relevant documents" in content:
+                                 print("  -> CHECKPOINT 2: Principal received and is processing the RAG results from the Associate.")
+                                 dispatch_completed = True
+
+                        if msg_type == 'error':
+                            print(f"❌ Error received: {data.get('data', {}).get('message')}")
+                            return False # Exit on any error
+
                     except asyncio.TimeoutError:
-                        elapsed = time.time() - last_activity
-                        if elapsed > max_timeout:
-                            print(f"❌ TIMEOUT: Test failed after {max_timeout}s")
-                            return False
-                        else:
-                            print(f"⚠️ No message for {individual_timeout}s (total elapsed: {elapsed:.1f}s)")
-                            continue
+                        print(f"⏳ Waiting... ({(time.time() - start_time):.1f}s elapsed)")
+                        continue
                     except Exception as e:
                         print(f"❌ WebSocket error: {e}")
                         return False
                 
-                # Check if we exceeded the total timeout
-                total_elapsed = time.time() - last_activity
-                if total_elapsed >= max_timeout:
-                    print(f"❌ TEST FAILED: Exceeded {max_timeout}s timeout")
-                    return False
-                
-                if response_count > 0:
-                    print(f"✓ Received {response_count} responses in {total_elapsed:.1f}s")
+                # Final check after the loop
+                if dispatch_completed:
+                    print("\n🎉 Test PASSED: Full Principal -> A2A Associate -> Principal communication cycle was successful!")
                     return True
                 else:
-                    print("❌ No responses received")
+                    print(f"\n❌ TEST FAILED: Did not complete the full A2A dispatch and result cycle within {max_timeout}s.")
                     return False
-                        
-                return True
+                # +++ END: REVISED LISTENING LOGIC +++
                 
         except Exception as e:
             print(f"❌ WebSocket test failed: {e}")
@@ -273,9 +205,6 @@ class CommonGroundRAGTester:
         tests = [
             ("Server Health", self.test_server_health),
             ("Metadata Endpoint", self.test_metadata_endpoint),
-            ("Session Creation & RAG Setup", self.test_list_rag_sources),
-            ("RAG Query Setup", lambda: self.test_rag_query("What is CommonGround and how does it work?")),
-            ("WebSocket RAG Stream", lambda: self.test_websocket_rag_stream("How do agents collaborate in CommonGround?")),
             ("WebSocket Architecture Query", lambda: self.test_websocket_rag_stream("Explain the CommonGround architecture and agent framework")),
         ]
         

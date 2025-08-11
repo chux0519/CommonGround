@@ -12,7 +12,7 @@ from ...framework.tool_registry import tool_registry
 from ...state.management import _create_flow_specific_state_template 
 from ...framework.profile_utils import get_active_profile_by_name
 from ...framework.handover_service import HandoverService
-from a2a.types import SendMessageRequest, MessageSendParams, Message, MessagePart
+from a2a.types import SendMessageRequest, MessageSendParams, Message, TextPart
 from agent_core.a2a_bridge.router import A2A_ROUTER
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ Called by the Principal to validate and assign a Work Module to an Associate Age
 
 @tool_registry(
     name="dispatch_submodules",
+    toolset_name="planning_tools",
     # Associate the tool with our newly created protocol
     handover_protocol="principal_to_associate_briefing", 
     description=DESCRIPTION,
@@ -177,15 +178,20 @@ class DispatcherNode(AsyncParallelBatchNode):
         tool_params = {"question": module_description} # 假设模块描述就是查询问题
 
         send_params = MessageSendParams(
-            message=Message(role='user', parts=[MessagePart(kind='text', text=f"Query for module {assignment_package.get('module_to_execute', {}).get('module_id')}")])
+            message=Message(
+                message_id=str(uuid.uuid4()),
+                role='user',
+                parts=[TextPart(kind='text', text=f"Query for module {assignment_package.get('module_to_execute', {}).get('module_id')}")]
+            ),
+            metadata={
+                "skill_id": skill_to_call,
+                "parameters": tool_params,
+                "context": {
+                    "run_id": run_context_global['meta'].get("run_id"),
+                    "project_id": run_context_global.get("project_id")
+                }
+            }
         )
-        # A2A SDK v0.2.0+ 将 skill_id 和 parameters 移到了 params 内部
-        send_params.skill_id = skill_to_call
-        send_params.parameters = tool_params
-        send_params.context = {
-            "run_id": run_context_global['meta'].get("run_id"),
-            "project_id": run_context_global.get("project_id") # RAG 工具需要 project_id
-        }
         
         a2a_intent = SendMessageRequest(id=str(uuid.uuid4()), params=send_params)
 

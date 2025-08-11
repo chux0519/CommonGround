@@ -66,23 +66,26 @@ async def lifespan_manager(app: FastAPI):
     # 2.1: Initialize MCP Session Pool (remains unchanged)
     global MCP_SESSION_POOL
     MCP_SESSION_POOL = asyncio.Queue()
-    logger.info("mcp_session_pool_initialized")
+    # logger.info("mcp_session_pool_initialized")
     
     # 2.2: Discover external tools via MCP (remains unchanged)
-    logger.info("tool_discovery_session_create_begin")
-    discovery_session_group = await initialize_mcp_session_for_context()
+    # logger.info("tool_discovery_session_create_begin")
+    # discovery_session_group = await initialize_mcp_session_for_context()
     
-    # 2.3: Initialize the Tool Registry (remains unchanged)
-    # This step is crucial. It loads all your Python-based tools (`@tool_registry`)
-    # AND any discovered MCP tools into the central `_TOOL_REGISTRY`.
-    if discovery_session_group:
-        await initialize_registry(discovery_session_group, "agent_core/nodes/custom_nodes")
-        await release_mcp_session_to_pool(discovery_session_group)
-        logger.info("tool_discovery_session_pooled")
-    else:
-        logger.warning("tool_discovery_session_failed")
-        # Still initialize with internal tools even if MCP fails
-        await initialize_registry(None, "agent_core/nodes/custom_nodes")
+    # # 2.3: Initialize the Tool Registry (remains unchanged)
+    # # This step is crucial. It loads all your Python-based tools (`@tool_registry`)
+    # # AND any discovered MCP tools into the central `_TOOL_REGISTRY`.
+    # if discovery_session_group:
+    #     await initialize_registry(discovery_session_group, "agent_core/nodes/custom_nodes")
+    #     await release_mcp_session_to_pool(discovery_session_group)
+    #     logger.info("tool_discovery_session_pooled")
+    # else:
+    #     logger.warning("tool_discovery_session_failed")
+    #     # Still initialize with internal tools even if MCP fails
+
+    # We pass `None` for the mcp_session_group to skip network discovery.
+    logger.info("tool_registry_init_begin", extra={"mode": "internal_only"})
+    await initialize_registry(None, "agent_core/nodes/custom_nodes")
 
     # +++ 2.4: NEW - Initialize and Register In-Memory A2A Agents +++
     # This new block runs AFTER the tool registry is initialized, because our

@@ -357,11 +357,18 @@ async def handle_start_run_message(ws_state: Dict, data: Dict):
         logger.info("new_run_request_received", extra={"session_id": session_id_for_log, "request_id": request_id, "run_type": run_type, "server_run_id": server_run_id})
 
         try:
+            initial_params_for_run = {}
+            if run_type == "principal_direct":
+                # Extract cli_mode_default_profiles from the message data
+                cli_profiles = data.get("cli_mode_default_profiles")
+                if cli_profiles:
+                    initial_params_for_run["cli_mode_default_profiles"] = cli_profiles
+
             initial_filename = data.get("initial_filename")
             run_context = create_run_context(
                 server_run_id=server_run_id,
                 run_type=run_type,
-                initial_params={},
+                initial_params=initial_params_for_run,
                 event_manager_for_websocket=event_manager,
                 project_id=project_id,
             )
@@ -890,6 +897,31 @@ async def handle_send_to_run_message(ws_state: Dict, data: Dict):
                 
                 # 2. Start the task
                 task = asyncio.create_task(run_partner_interaction_async(partner_context=partner_context))
+            elif run_type == "principal_direct":
+                principal_context = run_context['sub_context_refs']['_principal_context_ref']
+                principal_state = principal_context['state']
+                
+                # We need to give the Principal its first instruction.
+                # The most robust way is to put it in its inbox, just like we do for the Partner.
+                inbox_item = {
+                    "item_id": f"inbox_{uuid.uuid4().hex[:8]}",
+                    "source": "AGENT_STARTUP_BRIEFING", # Using this type is appropriate for an initial goal
+                    "payload": {
+                        "data": {
+                            "initial_briefing_for_principal": {
+                                "user_query": prompt_content,
+                                "notes_from_partner": "Direct execution mode activated. Proceed with planning and execution based on the user query."
+                            }
+                        },
+                        "schema_for_rendering": {} # Can be minimal for direct mode
+                    },
+                    "consumption_policy": "consume_on_read",
+                    "metadata": {"created_at": datetime.now(timezone.utc).isoformat()}
+                }
+                principal_state.setdefault("inbox", []).append(inbox_item)
+                
+                # Start the principal's main execution loop
+                task = asyncio.create_task(run_principal_async(principal_context=principal_context))
             else:
                 raise ValueError(f"Run type '{run_type}' does not support activation via 'send_to_run'.")
 

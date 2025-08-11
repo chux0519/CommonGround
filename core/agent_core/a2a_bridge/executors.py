@@ -1,3 +1,4 @@
+import json
 import logging
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -17,11 +18,12 @@ class SmartRAG_A2A_Executor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         try:
             # 1. 从 A2A 请求中解析出我们的自定义参数和 action_name
-            action_name = context.raw_request['params']['skill_id'] # A2A用skill_id表示要调用的技能
-            tool_params = context.raw_request['params'].get('parameters', {})
-            run_id = context.raw_request['params']['context']['run_id']
-            project_id = context.raw_request['params']['context']['project_id']
-            
+            metadata = context.metadata
+            action_name = metadata.get('skill_id')
+            tool_params = metadata.get('parameters', {})
+            run_id = metadata.get('context', {}).get('run_id')
+            project_id = metadata.get('context', {}).get('project_id')
+
             # 获取对应的工具节点类
             tool_info = get_tool_by_name(action_name)
             if not tool_info or not tool_info.get('node_class'):
@@ -56,17 +58,20 @@ class SmartRAG_A2A_Executor(AgentExecutor):
 
         prep_res = await tool_node_instance.prep_async(mock_sub_context)
         exec_res = await tool_node_instance.exec_async(prep_res)
+        res_txt = json.dumps(exec_res)
         # 注意: BaseToolNode的post_async会将结果放入inbox, 我们在这里不需要, 
         # 所以我们直接使用 exec_res。如果工具逻辑复杂，可能需要调整。
         # 对于 RAGQueryNode，exec_res 就是我们想要的结果。
 
         # 4. 将结果包装成 A2A 事件
-        await event_queue.enqueue_event(new_agent_text_message(exec_res))
+        await event_queue.enqueue_event(new_agent_text_message(res_txt))
         
         # 5. 发送 done 事件
-        await event_queue.enqueue_done_event()
+        # FIXME: should manually create TaskStatusUpdateEvent
+        # await event_queue.enqueue_event(TaskStatusUpdateEvent(status='done'))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # 实现 cancel 逻辑 (MVP 中可忽略)
         await event_queue.enqueue_error_event('Cancel not supported.')
-        await event_queue.enqueue_done_event()
+        # FIXME: should manually create TaskStatusUpdateEvent
+        # await event_queue.enqueue_event(TaskStatusUpdateEvent(status='done'))

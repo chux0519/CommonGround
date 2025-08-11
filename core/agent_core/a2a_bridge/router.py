@@ -34,9 +34,7 @@ class InMemoryA2ARouter:
         # 1. 模拟 A2A Server 的 RequestContext 和 EventQueue
         context = RequestContext(
             task_id=intent_request.id,
-            raw_request=intent_request.model_dump(),
-            message=intent_request.params.message,
-            # 其他字段可以根据需要填充
+            request=intent_request.params,
         )
         event_queue = EventQueue()
 

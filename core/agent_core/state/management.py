@@ -115,8 +115,8 @@ def create_run_context(
             if instance_id:
                 resolved_ids.append(instance_id)
         run_context["team_state"]["profiles_list_instance_ids"] = resolved_ids
-        
-        principal_ctx = create_principal_context(run_context_ref=run_context, parent_agent_id=None)
+
+        principal_ctx = create_principal_context(run_context_ref=run_context, parent_agent_id=None, iteration_mode="start_fresh")
         run_context["sub_context_refs"]["_principal_context_ref"] = principal_ctx
         logger.debug("principal_context_created", extra={"server_run_id": server_run_id})
 
