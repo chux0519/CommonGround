@@ -205,9 +205,13 @@ class DispatcherNode(AsyncParallelBatchNode):
                 final_tool_result = {}
                 message_data = a2a_result.get("message", {})
                 for part in message_data.get("parts", []):
-                    if part.get('kind') == 'json' and part.get('json_value'):
-                        final_tool_result = part['json_value']
-                        break
+                    if part.get('kind') == 'text' and part.get('text'):
+                        try:
+                            import json
+                            final_tool_result = json.loads(part['text'])
+                            break
+                        except Exception:
+                            pass
                 
                 # 返回与旧版兼容的结构
                 return {

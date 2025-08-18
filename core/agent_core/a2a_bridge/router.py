@@ -1,18 +1,21 @@
+# agent_core/a2a_bridge/router.py
+
 import logging
 import json
 import asyncio
 from typing import Dict, Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import Event, EventQueue
-from a2a.server.events.event_consumer import QueueClosed
-from a2a.types import TaskStatusUpdateEvent, Message, SendMessageRequest
+from a2a.server.events import Event, EventQueue, EventConsumer
+from a2a.server.tasks import TaskManager, ResultAggregator, InMemoryTaskStore
+from a2a.types import Message, SendMessageRequest, TextPart
 
 logger = logging.getLogger(__name__)
 
 class InMemoryA2ARouter:
     _instance = None
     _executors: Dict[str, AgentExecutor] = {}
+    _task_store = InMemoryTaskStore() # A store for the dummy task
 
     def __new__(cls):
         if cls._instance is None:
@@ -27,7 +30,7 @@ class InMemoryA2ARouter:
         return agent_name in self._executors
 
     async def route_intent(self, agent_name: str, intent_request: SendMessageRequest) -> Dict[str, Any]:
-        """[REVISED] 模拟 A2A 请求-响应流程，并正确地消费事件流。"""
+        """[REVISED] 使用 A2A SDK 的标准组件来模拟请求-响应流程。"""
         if agent_name not in self._executors:
             return {"status": "failure", "error": f"Agent '{agent_name}' not found."}
 
@@ -35,74 +38,62 @@ class InMemoryA2ARouter:
         
         # 1. 模拟 RequestContext 和 EventQueue (保持不变)
         context = RequestContext(
-            task_id=intent_request.id,
-            raw_request=intent_request.model_dump(by_alias=True),
-            message=intent_request.params.message,
+            request=intent_request.params,
+            task_id=intent_request.id
         )
         event_queue = EventQueue()
 
-        # 2. 创建一个后台任务来运行 Executor
-        #    这让 executor 可以和我们的消费循环并行运行
+        # 2. 创建一个后台任务来运行 Executor (Producer)
         agent_task = asyncio.create_task(executor.execute(context, event_queue))
 
-        # --- START FIX: 正确的事件消费循环 ---
-        
-        # 3. 从 EventQueue 中收集所有事件，直到收到 'final' 事件
-        events: list[Event] = []
+        # 3. 使用 SDK 的标准组件来消费事件 (Consumer)
         try:
-            while True:
-                try:
-                    # 使用带超时的 get 来防止永久阻塞，并允许检查 agent_task 的状态
-                    event = await asyncio.wait_for(event_queue.dequeue_event(), timeout=1.0)
-                    events.append(event)
-                    
-                    # 检查是否是结束事件
-                    is_final = False
-                    if isinstance(event, TaskStatusUpdateEvent):
-                        is_final = event.final
-                    elif isinstance(event, Message):
-                        # 在非流式场景下，单个 Message 也是结束信号
-                        is_final = True
+            # 创建一个临时的 TaskManager 来聚合状态
+            task_manager = TaskManager(
+                task_id=context.task_id,
+                context_id=context.context_id,
+                task_store=self._task_store,
+                initial_message=context.message,
+            )
+            
+            # ResultAggregator 封装了标准的事件消费逻辑
+            result_aggregator = ResultAggregator(task_manager)
+            
+            # EventConsumer 是从队列中安全读取事件的标准方式
+            consumer = EventConsumer(queue=event_queue)
+            
+            # 这是一个关键步骤：将 producer task 的完成状态（特别是异常）与 consumer 关联起来
+            agent_task.add_done_callback(consumer.agent_task_callback)
+            
+            # 使用 consume_all 等待并处理所有事件，直到流结束
+            final_result = await result_aggregator.consume_all(consumer)
 
-                    if is_final:
-                        break # 收到结束信号，退出循环
+            # 4. 从最终结果中提取消息
+            if isinstance(final_result, Message):
+                return {"status": "success", "message": final_result.model_dump()}
+            elif final_result: # It might be a Task object
+                # 尝试从 Task 历史中找到最后一条 agent 消息
+                last_agent_message = next((msg for msg in reversed(final_result.history or []) if msg.role == 'agent'), None)
+                if last_agent_message:
+                    return {"status": "success", "message": last_agent_message.model_dump()}
 
-                except asyncio.TimeoutError:
-                    # 超时后检查 agent_task 是否已经意外结束（例如，出错了）
-                    if agent_task.done():
-                        # 如果任务已结束但我们没收到 final event，说明有异常
-                        # agent_task.exception() 会重新抛出异常
-                        if agent_task.exception():
-                            raise agent_task.exception()
-                        break # 任务正常结束，退出循环
-                    continue # 任务还在运行，继续等待下一个事件
-                
-        except QueueClosed:
-            # 如果 executor 调用了 queue.close()，这也是一个合法的退出条件
-            logger.info(f"Event queue for agent '{agent_name}' was closed.")
+            # 如果没有直接的消息，从 executor 的结果中构建一个
+            # (这个 fallback 可能不需要，但为了健壮性保留)
+            if hasattr(result_aggregator, '_message') and result_aggregator._message:
+                 return {"status": "success", "message": result_aggregator._message.model_dump()}
+            
+            return {"status": "failure", "error": "Executor finished but did not produce a final message."}
+
         except Exception as e:
-            logger.error(f"Error while consuming events for '{agent_name}'", exc_info=True)
+            logger.error(f"Error while routing intent for '{agent_name}'", exc_info=True)
             return {"status": "failure", "error": f"Executor task failed: {e}"}
         finally:
-            # 确保 agent_task 被清理
+            # 确保后台任务和队列被清理
             if not agent_task.done():
                 agent_task.cancel()
-            await event_queue.close() # 确保队列被关闭
-        
-        # 简化版的结果组装：只关心 message 和 error 事件
-        final_parts = []
-        error_message = None
-        for event in events:
-            if event.event_type == 'message':
-                final_parts.extend(event.message.parts)
-            elif event.event_type == 'error':
-                error_message = event.message
-        
-        if error_message:
-            return {"status": "failure", "error": error_message}
+            if not event_queue.is_closed():
+                await event_queue.close()
 
-        final_message = Message(role='agent', parts=final_parts)
-        return {"status": "success", "message": final_message.model_dump()}
 
 # 创建一个全局单例
 A2A_ROUTER = InMemoryA2ARouter()
